@@ -1,0 +1,10 @@
+Bulk Operation Summary
+============================================================
+
+Operation ID: update_managers_20251114_122643
+Timestamp: 20251114_122648
+Total Records: 2
+Successful: 2
+Failed: 0
+
+Success Rate: 100.0%

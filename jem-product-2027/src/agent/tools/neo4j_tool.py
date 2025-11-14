@@ -115,15 +115,17 @@ async def query_neo4j_cypher(cypher_query: str) -> list[dict[str, Any]]:
 
 
 async def query_neo4j_with_natural_language(
-    question: str, employee_context: dict[str, Any]
+    question: str, employee_context: dict[str, Any], employer_id: int | None = None
 ) -> str:
     """Answer questions using Neo4j graph with LLM and tool calling.
 
     Uses Claude with the query_neo4j_cypher tool to answer questions.
+    Queries are scoped to the employer for data isolation.
 
     Args:
         question: Natural language question about org structure, relationships, etc.
         employee_context: Current employee's context for personalized queries.
+        employer_id: Employer ID for scoping queries (data isolation).
 
     Returns:
         Answer string from the graph query.
@@ -142,9 +144,14 @@ async def query_neo4j_with_natural_language(
         first_name = employee_context.get("first_name", "")
         last_name = employee_context.get("last_name", "")
 
+        # Get employer_id from employee_context if not provided
+        if not employer_id:
+            employer_id = employee_context.get("employer_id")
+
         system_prompt = f"""You are a helpful assistant with access to a Neo4j graph database containing employee information.
 
 Current employee: {first_name} {last_name} (ID: {employee_id})
+Employer ID: {employer_id} (IMPORTANT: All queries must filter by employer_id = {employer_id})
 
 Neo4j Schema:
 - Employee nodes: id, first_name, last_name, mobile_number, email, status, salary, employer_id, etc.
@@ -160,13 +167,17 @@ Key Relationships:
 
 When answering questions:
 1. Write a Cypher query using the query_neo4j_cypher tool
-2. Analyze the results
-3. Provide a clear, natural language answer
+2. IMPORTANT: Always filter by employer_id = {employer_id} in your WHERE clauses
+3. Analyze the results
+4. Provide a clear, natural language answer
 
-Example queries:
-- To find manager: MATCH (e:Employee {{id: {employee_id}}})-[:REPORTS_TO]->(manager:Employee) RETURN manager
-- To find direct reports: MATCH (report:Employee)-[:REPORTS_TO]->(e:Employee {{id: {employee_id}}}) RETURN report
-- To find division: MATCH (e:Employee {{id: {employee_id}}})-[:IN_DIVISION]->(d:Division) RETURN d
+Example queries (MUST include employer_id filter):
+- To find manager: MATCH (e:Employee {{id: {employee_id}, employer_id: {employer_id}}})-[:REPORTS_TO]->(manager:Employee) WHERE manager.employer_id = {employer_id} RETURN manager
+- To find direct reports: MATCH (report:Employee)-[:REPORTS_TO]->(e:Employee {{id: {employee_id}}}) WHERE report.employer_id = {employer_id} AND e.employer_id = {employer_id} RETURN report
+- To find division: MATCH (e:Employee {{id: {employee_id}, employer_id: {employer_id}}})-[:IN_DIVISION]->(d:Division) RETURN d
+- To list all employees: MATCH (e:Employee {{employer_id: {employer_id}}}) RETURN e
+
+CRITICAL: Never return employees from other employers. Always add WHERE clauses to filter by employer_id = {employer_id}.
 """
 
         messages = [
