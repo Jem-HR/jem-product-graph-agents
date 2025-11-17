@@ -1,12 +1,12 @@
-"""Smart CSV Agent with planning capabilities for variable-format, dirty data.
+"""Smart CSV Agent using Deep Agents TodoListMiddleware for adaptive planning.
 
-Implements Deep Agents pattern using LangGraph:
-- TodoList-style planning and progress tracking
+This agent uses the official Deep Agents library for:
+- Automatic task decomposition and planning
+- Progress tracking with write_todos tool
 - Adaptive workflows based on CSV inspection
-- Data cleaning and validation
-- Error recovery and replanning
+- Data cleaning and validation with replanning
 
-This agent handles CSVs with:
+Handles CSVs with:
 - Different column name variations (90+ patterns)
 - Dirty data (formatting issues, missing values)
 - Inconsistent formats across files
@@ -14,330 +14,113 @@ This agent handles CSVs with:
 
 from __future__ import annotations
 
-from typing import Any, Annotated
-from datetime import datetime
+from typing import Any
 
-from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain.agents import create_agent
+from langchain.agents.middleware import TodoListMiddleware
 from langchain_core.tools import tool
-from langgraph.graph import StateGraph, add_messages, END
-from langgraph.runtime import Runtime
-from typing_extensions import TypedDict
+from langgraph.store.memory import InMemoryStore
 
 from agent.tools.csv_intelligence_tool import inspect_csv_structure, map_csv_columns
 from agent.tools.data_cleaning_tool import batch_clean_csv_records
-from agent.tools.batch_operations_tool import batch_create_employees, batch_update_managers
-from agent.tools.authorization import check_permission, Permission
+from agent.tools.batch_operations_tool import (
+    batch_create_employees,
+    batch_update_managers,
+    batch_initialize_leave_balances,
+)
+from agent.tools.csv_processing_tool import save_processing_results
+from agent.tools.authorization import check_permission, Permission, log_audit_event
 
 
-class SmartCSVState(TypedDict):
-    """State for Smart CSV processing with planning."""
+# Deep Agents system prompt for CSV processing
+SMART_CSV_SYSTEM_PROMPT = """You are an intelligent CSV processor for HR employee data.
 
-    messages: Annotated[list[BaseMessage], add_messages]
-    todos: list[dict[str, str]]  # Task list with status tracking
-    file_path: str | None
-    operation: str | None
-    csv_analysis: dict[str, Any] | None
-    column_mappings: dict[str, Any] | None
-    cleaned_data: dict[str, Any] | None
-    processing_results: dict[str, Any] | None
-    admin_id: int
-    employer_id: int
-    current_step: str
+Your job is to process CSV files that may have:
+- Variable column names (e.g., "First Name" vs "FirstName" vs "Given Name")
+- Dirty data (phone numbers with formatting, mixed case, missing values)
+- Inconsistent formats across different files
 
+**CRITICAL: Always use the write_todos tool to plan your approach before processing.**
 
-async def create_processing_plan(state: SmartCSVState, runtime: Runtime) -> dict[str, Any]:
-    """Inspect CSV and create adaptive processing plan.
+**Standard Workflow:**
 
-    This implements TodoList-style planning based on CSV inspection.
-    """
-    file_path = state.get("file_path")
-    operation = state.get("operation")
+1. **Plan Phase** (use write_todos):
+   - Inspect CSV structure to understand columns and data quality
+   - Create a processing plan with discrete steps
+   - Update plan if you discover issues
 
-    # Inspect CSV structure
-    analysis_result = inspect_csv_structure.invoke({"file_path": file_path})
+2. **Inspection Phase**:
+   - Use inspect_csv_structure tool to analyze the file
+   - Check columns, data types, quality issues, missing values
+   - Identify what cleaning is needed
 
-    if not analysis_result["success"]:
-        return {
-            "messages": [AIMessage(content=f"❌ CSV inspection failed: {analysis_result['error']}")],
-            "current_step": "failed"
-        }
+3. **Column Mapping Phase**:
+   - Use map_csv_columns to fuzzy match column names
+   - Handle variations like "First Name" → first_name
+   - Verify all required fields can be mapped
 
-    csv_analysis = analysis_result
+4. **Data Cleaning Phase**:
+   - Use batch_clean_csv_records to clean and validate data
+   - Handles: mobile numbers (+27 82...), emails, salaries (R 55,000)
+   - Track valid vs invalid records
 
-    # Create adaptive plan based on inspection
-    todos = [
-        {"task": f"Inspect CSV structure ({csv_analysis['total_rows']} rows, {csv_analysis['total_columns']} columns)", "status": "completed"},
-        {"task": "Map columns to schema", "status": "pending"},
-    ]
+5. **Processing Phase**:
+   - Use batch_create_employees or batch_update_managers
+   - Process in batches of 100 records
+   - Handle errors gracefully
 
-    # Add data cleaning tasks if needed
-    if csv_analysis.get("cleaning_needed"):
-        for cleaning_task in csv_analysis["cleaning_needed"]:
-            todos.append({
-                "task": f"Clean {cleaning_task['column']}: {cleaning_task['issue']}",
-                "status": "pending"
-            })
+6. **Reporting Phase**:
+   - Use save_processing_results to generate output files
+   - Create success.csv, errors.csv, summary.txt
+   - Log audit event for compliance
 
-    # Add validation task
-    todos.append({"task": "Validate and clean all records", "status": "pending"})
+7. **Update Todos**:
+   - Mark steps as completed as you progress
+   - Adapt plan if errors occur
+   - Provide final summary
 
-    # Add processing task
-    if operation == "import_employees":
-        todos.append({"task": f"Batch create {csv_analysis['total_rows']} employees", "status": "pending"})
-        todos.append({"task": "Initialize leave balances", "status": "pending"})
-    elif operation == "update_managers":
-        todos.append({"task": f"Batch update {csv_analysis['total_rows']} manager relationships", "status": "pending"})
+**Key Principles:**
+- Always create todos BEFORE starting work
+- Update todos as you progress (pending → in_progress → completed)
+- Be adaptive - if inspection reveals issues, update your plan
+- Provide detailed error information for failed records
+- Maintain employer_id scoping for multi-tenant security
 
-    # Add reporting task
-    todos.append({"task": "Generate processing report and result files", "status": "pending"})
-
-    # Create summary message
-    summary = AIMessage(content=f"""📊 **CSV Analysis Complete**
-
-**File:** {file_path}
-**Rows:** {csv_analysis['total_rows']}
-**Columns:** {csv_analysis['total_columns']}
-
-**Columns Found:**
-{', '.join(csv_analysis['columns'])}
-
-**Data Quality:**
-- Missing values: {csv_analysis['data_quality']['total_missing_values']}
-- Rows with missing data: {csv_analysis['data_quality']['rows_with_missing']}
-- Duplicate rows: {csv_analysis['data_quality']['duplicate_rows']}
-
-**Cleaning Required:**
-{chr(10).join(f"- {item['column']}: {item['issue']}" for item in csv_analysis.get('cleaning_needed', []))}
-
-**Processing Plan Created:**
-{chr(10).join(f"{i+1}. {todo['task']}" for i, todo in enumerate(todos))}
-
-Proceeding with processing...""")
-
-    return {
-        "messages": [summary],
-        "todos": todos,
-        "csv_analysis": csv_analysis,
-        "current_step": "map_columns"
-    }
-
-
-async def map_columns_step(state: SmartCSVState, runtime: Runtime) -> dict[str, Any]:
-    """Map CSV columns to expected schema using fuzzy matching."""
-    csv_analysis = state.get("csv_analysis", {})
-    todos = state.get("todos", [])
-
-    # Map columns
-    mapping_result = map_csv_columns.invoke({
-        "csv_columns": csv_analysis.get("columns", [])
-    })
-
-    # Update todos
-    for todo in todos:
-        if "Map columns" in todo["task"]:
-            todo["status"] = "completed"
-            break
-
-    # Check if we have good mappings
-    mappings = mapping_result.get("mappings", {})
-    required_fields = ["first_name", "last_name", "mobile_number", "email"]
-
-    if state.get("operation") == "update_managers":
-        required_fields = ["employee_id", "new_manager_id"]
-
-    missing_required = [f for f in required_fields if f not in mappings]
-
-    if missing_required:
-        return {
-            "messages": [AIMessage(content=f"❌ Cannot map required fields: {', '.join(missing_required)}")],
-            "todos": todos,
-            "current_step": "failed"
-        }
-
-    return {
-        "todos": todos,
-        "column_mappings": mappings,
-        "current_step": "clean_data"
-    }
-
-
-async def clean_data_step(state: SmartCSVState, runtime: Runtime) -> dict[str, Any]:
-    """Clean and validate CSV data."""
-    file_path = state.get("file_path")
-    column_mappings = state.get("column_mappings", {})
-    todos = state.get("todos", [])
-
-    # Read CSV and apply mappings
-    import pandas as pd
-    df = pd.read_csv(file_path)
-
-    # Create renamed dataframe
-    rename_map = {m["csv_column"]: field for field, m in column_mappings.items()}
-    records = df.to_dict('records')
-
-    # Extract simple column mappings for cleaning tool
-    simple_mappings = {field: m["csv_column"] for field, m in column_mappings.items()}
-
-    # Clean records
-    cleaning_result = batch_clean_csv_records.invoke({
-        "records": records,
-        "column_mappings": column_mappings  # Pass full mappings - tool will extract csv_column
-    })
-
-    # Update todos - mark cleaning tasks complete
-    for todo in todos:
-        if "Clean" in todo["task"] or "Validate" in todo["task"]:
-            todo["status"] = "completed"
-
-    summary_msg = AIMessage(content=f"""✅ **Data Cleaning Complete**
-
-**Results:**
-- Total records: {len(records)}
-- Successfully cleaned: {cleaning_result['clean_count']}
-- Failed validation: {cleaning_result['failed_count']}
-- Success rate: {cleaning_result['success_rate']:.1f}%
-
-Proceeding to batch processing...""")
-
-    return {
-        "messages": [summary_msg],
-        "todos": todos,
-        "cleaned_data": cleaning_result,
-        "current_step": "process_batch"
-    }
-
-
-async def process_batch_step(state: SmartCSVState, runtime: Runtime) -> dict[str, Any]:
-    """Process cleaned records in batches."""
-    operation = state.get("operation")
-    cleaned_data = state.get("cleaned_data", {})
-    admin_id = state.get("admin_id")
-    employer_id = state.get("employer_id")
-    todos = state.get("todos", [])
-
-    cleaned_records = cleaned_data.get("cleaned_records", [])
-
-    if not cleaned_records:
-        return {
-            "messages": [AIMessage(content="❌ No valid records to process")],
-            "current_step": "failed"
-        }
-
-    # Process based on operation type
-    if operation == "import_employees":
-        result = await batch_create_employees.ainvoke({
-            "records": cleaned_records,
-            "employer_id": employer_id,
-            "admin_id": admin_id,
-            "batch_size": 100
-        })
-
-    elif operation == "update_managers":
-        result = await batch_update_managers.ainvoke({
-            "records": cleaned_records,
-            "employer_id": employer_id,
-            "admin_id": admin_id,
-            "batch_size": 100
-        })
-    else:
-        return {
-            "messages": [AIMessage(content=f"❌ Unknown operation: {operation}")],
-            "current_step": "failed"
-        }
-
-    # Update todos
-    for todo in todos:
-        if "Batch" in todo["task"]:
-            todo["status"] = "completed"
-
-    return {
-        "todos": todos,
-        "processing_results": result,
-        "current_step": "generate_report"
-    }
-
-
-async def generate_report_step(state: SmartCSVState, runtime: Runtime) -> dict[str, Any]:
-    """Generate final processing report."""
-    processing_results = state.get("processing_results", {})
-    cleaned_data = state.get("cleaned_data", {})
-    todos = state.get("todos", [])
-
-    # Mark reporting todo complete
-    for todo in todos:
-        if "report" in todo["task"].lower():
-            todo["status"] = "completed"
-
-    # Generate summary
-    total_csv_records = cleaned_data.get("clean_count", 0) + cleaned_data.get("failed_count", 0)
-    db_successes = processing_results.get("success_count", 0)
-    db_failures = processing_results.get("failure_count", 0)
-
-    summary = f"""🎉 **Processing Complete!**
-
-**CSV Processing:**
-- Total rows in CSV: {total_csv_records}
-- Passed data cleaning: {cleaned_data.get('clean_count', 0)}
-- Failed data cleaning: {cleaned_data.get('failed_count', 0)}
-
-**Database Operations:**
-- Successfully processed: {db_successes}
-- Failed: {db_failures}
-- Overall success rate: {processing_results.get('success_rate', 0):.1f}%
-
-**Task Completion:**
-{chr(10).join(f"{'✅' if t['status'] == 'completed' else '⏸'} {t['task']}" for t in todos)}
+**Available Tools:**
+- write_todos - Plan and track your work
+- inspect_csv_structure - Analyze CSV file
+- map_csv_columns - Fuzzy match column names
+- batch_clean_csv_records - Clean and validate data
+- batch_create_employees - Import new employees
+- batch_update_managers - Update reporting relationships
+- batch_initialize_leave_balances - Set up leave for new employees
+- save_processing_results - Generate output files
 """
 
-    return {
-        "messages": [AIMessage(content=summary)],
-        "todos": todos,
-        "current_step": "completed"
-    }
+
+# Create the Deep Agents smart CSV processor
+# This uses TodoListMiddleware to automatically enable planning
+smart_csv_deep_agent = create_agent(
+    model="claude-sonnet-4-5-20250929",  # Sonnet for complex reasoning
+    tools=[
+        inspect_csv_structure,
+        map_csv_columns,
+        batch_clean_csv_records,
+        batch_create_employees,
+        batch_update_managers,
+        batch_initialize_leave_balances,
+        save_processing_results,
+    ],
+    middleware=[
+        TodoListMiddleware(
+            system_prompt=SMART_CSV_SYSTEM_PROMPT
+        ),
+    ],
+    store=InMemoryStore(),  # For context management
+)
 
 
-def route_step(state: SmartCSVState) -> str:
-    """Route to next step based on current_step."""
-    current = state.get("current_step", "")
-
-    routes = {
-        "map_columns": "map_columns_step",
-        "clean_data": "clean_data_step",
-        "process_batch": "process_batch_step",
-        "generate_report": "generate_report_step",
-        "completed": END,
-        "failed": END,
-    }
-
-    return routes.get(current, END)
-
-
-# Build the Smart CSV Agent graph with planning
-workflow = StateGraph(SmartCSVState)
-
-# Add nodes (planning workflow)
-workflow.add_node("create_processing_plan", create_processing_plan)
-workflow.add_node("map_columns_step", map_columns_step)
-workflow.add_node("clean_data_step", clean_data_step)
-workflow.add_node("process_batch_step", process_batch_step)
-workflow.add_node("generate_report_step", generate_report_step)
-
-# Set entry point
-workflow.set_entry_point("create_processing_plan")
-
-# Add conditional routing
-workflow.add_conditional_edges("create_processing_plan", route_step)
-workflow.add_conditional_edges("map_columns_step", route_step)
-workflow.add_conditional_edges("clean_data_step", route_step)
-workflow.add_conditional_edges("process_batch_step", route_step)
-workflow.add_edge("generate_report_step", END)
-
-# Compile graph
-smart_csv_graph = workflow.compile(name="Smart CSV Processor")
-
-
-# Wrapper tool for use in supervisor
+# Wrapper tool for integration with HR Admin supervisor
 @tool
 async def smart_csv_agent(
     file_path: str,
@@ -345,15 +128,14 @@ async def smart_csv_agent(
     admin_id: int,
     employer_id: int,
 ) -> str:
-    """Process variable-format CSV files with intelligent data cleaning.
+    """Process variable-format CSV files with intelligent data cleaning using Deep Agents.
 
-    Uses adaptive planning to handle:
-    - Different column name variations
-    - Dirty/inconsistent data
-    - Missing values
-    - Format variations
-
-    Creates a processing plan, cleans data, and batch processes with progress tracking.
+    This agent uses Deep Agents TodoListMiddleware to:
+    - Automatically create a processing plan
+    - Track progress with todos
+    - Adapt to data quality issues
+    - Clean dirty data (phone numbers, emails, salaries)
+    - Handle 90+ column name variations
 
     Args:
         file_path: Path to CSV file.
@@ -371,23 +153,58 @@ async def smart_csv_agent(
     if not auth_result["authorized"]:
         return f"❌ Permission denied: {auth_result['reason']}"
 
-    # Initialize state and run planning workflow
-    initial_state = {
-        "messages": [],
-        "todos": [],
-        "file_path": file_path,
-        "operation": operation,
-        "admin_id": admin_id,
-        "employer_id": employer_id,
-        "current_step": "inspect"
-    }
+    # Build task description for Deep Agent
+    task_description = f"""Process this CSV file with intelligent cleaning and validation:
 
-    # Run the smart CSV processing graph
-    result = await smart_csv_graph.ainvoke(initial_state)
+**File:** {file_path}
+**Operation:** {operation}
+**Admin ID:** {admin_id}
+**Employer ID:** {employer_id} (IMPORTANT: All operations must be scoped to this employer)
 
-    # Return formatted summary
-    messages = result.get("messages", [])
-    if messages:
-        return "\n\n".join(msg.content for msg in messages if isinstance(msg, AIMessage))
+**Your Task:**
+1. Inspect the CSV file to understand its structure
+2. Create a detailed processing plan using write_todos
+3. Map columns to the required schema (handle variations)
+4. Clean any dirty data (mobiles, emails, salaries)
+5. Validate all records
+6. Batch process valid records (100 per batch)
+7. Initialize leave balances for new employees (if importing)
+8. Generate detailed results (success.csv, errors.csv, summary.txt)
+9. Log audit event
 
-    return "Processing completed"
+**Required Schema Fields:**
+For import_employees: first_name, last_name, mobile_number, email, employee_no
+For update_managers: employee_id, new_manager_id
+
+**Scoping Rule:**
+All operations must use employer_id={employer_id} to ensure multi-tenant data isolation.
+
+Begin by creating your processing plan with write_todos!"""
+
+    try:
+        # Invoke Deep Agent with task description
+        # The agent will automatically use write_todos to plan its approach
+        result = await smart_csv_deep_agent.ainvoke({
+            "messages": [{"role": "user", "content": task_description}]
+        })
+
+        # Extract the final response
+        messages = result.get("messages", [])
+        if messages:
+            final_response = messages[-1]
+            return final_response.content if hasattr(final_response, "content") else str(final_response)
+
+        return "Processing completed"
+
+    except Exception as e:
+        # Log failure
+        await log_audit_event(
+            admin_id=admin_id,
+            operation=f"smart_csv_{operation}",
+            target_entity="Employee",
+            target_id=0,
+            success=False,
+            error_message=str(e)
+        )
+
+        return f"❌ Smart CSV processing failed: {str(e)}"
