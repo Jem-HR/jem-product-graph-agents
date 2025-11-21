@@ -15,6 +15,7 @@ dependencies = [
     "langchain-anthropic>=1.0.0",
     "neo4j>=5.0.0",
     "langchain-neo4j>=0.6.0",
+    "deepagents>=0.1.0",
 ]
 
 
